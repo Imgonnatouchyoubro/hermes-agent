@@ -168,7 +168,7 @@ delegation:
 
 Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` applies in all cases, and when it is empty children inherit the parent's model.
 
-Note that the pin is global: `delegate_task` has no per-task model parameter, so every child in a batch runs on the configured delegation model. For quality-sensitive subtasks that need a stronger model, either leave `delegation.model` unset for that session or hand the task to the [kanban board](kanban.md#per-task-model-override), which does support a per-task model override.
+`delegate_task` also accepts per-call `model` and `provider` overrides, so a single batch can run different children on different models or providers without changing `delegation.*`. Pass them at the top level to set a default for every task in the call, or per-entry via `tasks[].model` / `tasks[].provider` to override the top-level value (and the `delegation.*` default) for just that task. `delegation.model` / `delegation.provider` remain the global default applied when the call does not specify a value. For durable per-task overrides that live outside a single call, hand the task to the [kanban board](kanban.md#per-task-model-override), which stores a per-task model override.
 
 ## Inherited Tool Access
 
