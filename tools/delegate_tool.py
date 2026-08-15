@@ -3433,6 +3433,8 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
@@ -3486,6 +3488,8 @@ def delegate_task(
 
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
+    top_model = str(model or "").strip() or None
+    top_provider = str(provider or "").strip() or None
 
     # Background (async) delegation now applies to BOTH single tasks and
     # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
@@ -3561,7 +3565,13 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "model": top_model,
+            "provider": top_provider,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3606,6 +3616,23 @@ def delegate_task(
         if schema_err:
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
+
+    # Per-task model/provider resolution. Fails fast before any child is
+    # spawned (mirrors the output_schema pre-pass above). Tasks without an
+    # override resolve to the config-derived `creds` dict.
+    task_creds: List[dict] = []
+    for i, task in enumerate(task_list):
+        try:
+            task_creds.append(
+                _apply_per_call_overrides(
+                    cfg,
+                    creds,
+                    model=task.get("model"),
+                    provider=task.get("provider"),
+                )
+            )
+        except ValueError as exc:
+            return tool_error(f"Task {i} provider invalid: {exc}")
 
     overall_start = time.monotonic()
     results = []
@@ -3668,6 +3695,7 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        _task_creds = task_creds[i] if i < len(task_creds) else creds
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -3675,18 +3703,18 @@ def delegate_task(
             # Subagents always inherit the parent's toolsets; the model
             # cannot choose or narrow them (no model-facing toolsets arg).
             toolsets=None,
-            model=creds["model"],
+            model=_task_creds["model"],
             max_iterations=effective_max_iter,
             task_count=n_tasks,
             parent_agent=parent_agent,
-            override_provider=creds["provider"],
-            override_base_url=creds["base_url"],
-            override_api_key=creds["api_key"],
-            override_api_mode=creds["api_mode"],
-            override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
-            override_acp_command=creds.get("command"),
-            override_acp_args=creds.get("args"),
+            override_provider=_task_creds["provider"],
+            override_base_url=_task_creds["base_url"],
+            override_api_key=_task_creds["api_key"],
+            override_api_mode=_task_creds["api_mode"],
+            override_request_overrides=_task_creds.get("request_overrides"),
+            override_max_tokens=_task_creds.get("max_output_tokens"),
+            override_acp_command=_task_creds.get("command"),
+            override_acp_args=_task_creds.get("args"),
             role=effective_role,
         )
         # Attach the validated schema for the completion-side validation
@@ -4364,6 +4392,74 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _apply_per_call_overrides(
+    cfg: dict,
+    base_creds: dict,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> dict:
+    """Merge per-call delegate_task model/provider overrides into resolved creds.
+
+    ``model`` / ``provider`` are model-facing args (names only, never URLs or
+    keys). ``provider`` triggers a full credential resolution via the runtime
+    provider system — the same path the config delegation.provider branch uses.
+    ``model`` on its own is a shallow merge over whatever provider/base_url
+    resolution already produced, so a model-only override keeps the parent (or
+    configured) provider credentials. Returns ``base_creds`` unchanged when
+    neither override is given.
+
+    Raises ValueError with a user-friendly message on credential failure.
+    """
+    model = str(model or "").strip() or None
+    provider = str(provider or "").strip() or None
+
+    if not model and not provider:
+        return base_creds
+
+    if not provider:
+        # model-only: keep the resolved provider/endpoint, swap the model name.
+        merged = dict(base_creds)
+        merged["model"] = model
+        return merged
+
+    # per-call provider -> resolve the full bundle (named providers only).
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(
+            requested=provider, target_model=model
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot resolve delegation provider '{provider}': {exc}. "
+            f"Check that the provider is configured (API key set, valid "
+            f"provider name)."
+        ) from exc
+
+    api_key = runtime.get("api_key", "")
+    if not api_key:
+        raise ValueError(
+            f"Delegation provider '{provider}' resolved but has no API key. "
+            f"Set the appropriate environment variable or run 'hermes auth'."
+        )
+
+    return {
+        "model": model or runtime.get("model") or None,
+        "provider": (
+            provider
+            if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM
+            else runtime.get("provider")
+        ),
+        "base_url": runtime.get("base_url"),
+        "api_key": api_key,
+        "api_mode": runtime.get("api_mode"),
+        "request_overrides": dict(runtime.get("request_overrides") or {}),
+        "max_output_tokens": runtime.get("max_output_tokens"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+    }
+
+
 def _load_config() -> dict:
     """Load delegation config from the active Hermes config.
 
@@ -4425,14 +4521,14 @@ def _build_top_level_description() -> str:
         "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
         "(limits and nesting rules are in the parameter descriptions).\n\n"
         "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
-        "LIVE ORCHESTRATION: while children run, this tool also controls "
-        "them — action='list' (live children + ids), action='steer' "
+        "transcript paths, and the completed result (one message per batch) "
+        "re-enters the conversation. Do NOT wait or poll; continue other "
+        "work.\n\n"
+        "LIVE ORCHESTRATION: this tool also controls running children — "
+        "action='list' (live children + ids), action='steer' "
         "(subagent_id + message, redirect without stopping), action='stop' "
         "(subagent_id, end early; partial result still returns). Steer when "
-        "a live transcript shows a child drifting.\n\n"
+        "a child drifts.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -4448,15 +4544,16 @@ def _build_top_level_description() -> str:
         "style (e.g. \"respond in Chinese\").\n"
         "- Child summaries are SELF-REPORTS, not verified facts: a child "
         "claiming \"uploaded successfully\" or \"file written\" may be wrong. "
-        "For external side effects (uploads, remote writes, publishing), "
-        "require a verifiable handle (URL, ID, absolute path) and verify it "
-        "yourself — fetch the URL, stat the file, read back the content — "
+        "For external side effects (uploads, remote writes), require a "
+        "verifiable handle (URL, ID) and verify it yourself — fetch the URL, "
+        "stat the file, read back the content — "
         "before telling the user the operation succeeded.\n"
         "- Leaf children (the default) cannot call delegate_task, clarify, "
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
         "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
+        "globally via delegation.provider / delegation.model in config.yaml, "
+        "or per-call 'model'/'provider' (tasks[].model/.provider in batch mode). "
         "Results are returned as an array, one entry per task."
     )
 
@@ -4471,7 +4568,10 @@ def _build_tasks_param_description() -> str:
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
-        "When provided, top-level goal/context/role are ignored."
+        "When provided, top-level goal/context/role are ignored. "
+        "Each task may also set 'model' and/or 'provider' to route that one "
+        "subagent to a specific model/provider, overriding delegation.model "
+        "/ delegation.provider."
     )
 
 
@@ -4569,6 +4669,26 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model to run the subagent(s) on, overriding the parent's "
+                    "model and any delegation.model. Pass a model NAME only; provider "
+                    "credentials still resolve from config or the parent. Combine with "
+                    "'provider' to route children to a different provider:model pair. "
+                    "In batch mode, tasks[].model beats this top-level value."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Optional provider to run the subagent(s) on, overriding the parent's "
+                    "provider and any delegation.provider. A NAMED provider only (e.g. "
+                    "openrouter, anthropic, nous) resolved through the existing provider "
+                    "config — arbitrary endpoints/URLs are NOT accepted. Combine with "
+                    "'model'. In batch mode, tasks[].provider beats this top-level value."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4583,6 +4703,22 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Per-task model override (beats top-level 'model' and "
+                                "delegation.model). Provider credentials still resolve from config "
+                                "or the parent."
+                            ),
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": (
+                                "Per-task provider override (beats top-level 'provider' and "
+                                "delegation.provider). Named provider only; arbitrary endpoints are "
+                                "NOT accepted."
+                            ),
                         },
                         "output_schema": {
                             "type": "object",
@@ -4723,6 +4859,8 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
+        model=args.get("model"),
+        provider=args.get("provider"),
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
