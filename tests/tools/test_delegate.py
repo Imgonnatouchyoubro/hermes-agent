@@ -21,6 +21,7 @@ from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
     DelegateEvent,
+    _apply_per_call_overrides,
     _get_max_concurrent_children,
     _load_config,
     delegate_task,
@@ -995,6 +996,329 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("Cannot resolve", result["error"])
         self.assertIn("nonexistent", result["error"])
+
+class TestPerCallModelProviderOverride(unittest.TestCase):
+    """Per-call delegate_task model/provider overrides.
+
+    Covers the ``_apply_per_call_overrides`` helper (unit) plus the
+    ``delegate_task`` wiring for single-goal and batch fan-out, and the
+    model-facing schema exposure of the new ``model``/``provider`` args.
+    """
+
+    # ------------------------------------------------------------------
+    # Unit tests for _apply_per_call_overrides
+    # ------------------------------------------------------------------
+
+    def test_no_override_returns_base_creds_unchanged(self):
+        base_creds = {
+            "model": "parent-model",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-x",
+            "api_mode": "chat_completions",
+        }
+        result = _apply_per_call_overrides(base_creds)
+        # Neither override given -> the SAME dict object is returned untouched.
+        self.assertIs(result, base_creds)
+        self.assertEqual(result, base_creds)
+
+    def test_model_only_override_swaps_model_keeps_creds(self):
+        base_creds = {
+            "model": "parent-model",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-x",
+            "api_mode": "chat_completions",
+        }
+        result = _apply_per_call_overrides(
+            base_creds, model="anthropic/claude-sonnet-4"
+        )
+        self.assertEqual(result["model"], "anthropic/claude-sonnet-4")
+        self.assertEqual(result["provider"], "openrouter")
+        self.assertEqual(result["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(result["api_key"], "sk-x")
+        self.assertEqual(result["api_mode"], "chat_completions")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_provider_override_resolves_runtime_bundle(self, mock_resolve):
+        mock_resolve.return_value = {
+            "provider": "minimax",
+            "base_url": "https://api.minimax.io",
+            "api_key": "sk-minimax",
+            "api_mode": "anthropic_messages",
+        }
+        result = _apply_per_call_overrides(
+            {}, provider="minimax-cn", model="minimax/MiniMax-M2"
+        )
+        mock_resolve.assert_called_once_with(
+            requested="minimax-cn", target_model="minimax/MiniMax-M2"
+        )
+        self.assertEqual(result["model"], "minimax/MiniMax-M2")
+        self.assertEqual(result["provider"], "minimax")
+        self.assertEqual(result["base_url"], "https://api.minimax.io")
+        self.assertEqual(result["api_key"], "sk-minimax")
+        self.assertEqual(result["api_mode"], "anthropic_messages")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_provider_resolution_failure_raises_valueerror(self, mock_resolve):
+        mock_resolve.side_effect = RuntimeError("boom")
+        with self.assertRaises(ValueError) as ctx:
+            _apply_per_call_overrides({}, provider="nope")
+        self.assertIn("Cannot resolve delegation provider", str(ctx.exception))
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_provider_without_api_key_raises_valueerror(self, mock_resolve):
+        mock_resolve.return_value = {"api_key": ""}
+        with self.assertRaises(ValueError) as ctx:
+            _apply_per_call_overrides({}, provider="nope")
+        self.assertIn("has no API key", str(ctx.exception))
+
+    def test_empty_string_overrides_treated_as_absent(self):
+        base_creds = {
+            "model": "parent-model",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-x",
+            "api_mode": "chat_completions",
+        }
+        result = _apply_per_call_overrides(base_creds, model="", provider="  ")
+        # Empty / whitespace-only overrides are "no override" -> unchanged.
+        self.assertIs(result, base_creds)
+        self.assertEqual(result, base_creds)
+
+    # ------------------------------------------------------------------
+    # Integration tests: delegate_task per-call model/provider wiring
+    # ------------------------------------------------------------------
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_single_goal_model_override_reaches_child(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 45}
+        mock_creds.return_value = {
+            "model": "parent-model",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="x", model="new-model", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["model"], "new-model")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_batch_top_level_model_is_default_for_all_children(
+        self, mock_creds, mock_cfg
+    ):
+        mock_cfg.return_value = {"max_iterations": 45}
+        mock_creds.return_value = {
+            "model": "parent-model",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._run_single_child"
+        ) as mock_run:
+            MockAgent.return_value = MagicMock()
+            mock_run.side_effect = [
+                {
+                    "task_index": 0,
+                    "status": "completed",
+                    "summary": "A",
+                    "api_calls": 2,
+                    "duration_seconds": 1.0,
+                    "_child_role": "leaf",
+                    "_child_cost_usd": 0.15,
+                },
+                {
+                    "task_index": 1,
+                    "status": "completed",
+                    "summary": "B",
+                    "api_calls": 2,
+                    "duration_seconds": 1.0,
+                    "_child_role": "leaf",
+                    "_child_cost_usd": 0.27,
+                },
+            ]
+
+            delegate_task(
+                tasks=[
+                    {"goal": "Investigate module A"},
+                    {"goal": "Investigate module B"},
+                ],
+                model="batch-model",
+                parent_agent=parent,
+            )
+
+            self.assertEqual(
+                MockAgent.call_args_list[0].kwargs["model"], "batch-model"
+            )
+            self.assertEqual(
+                MockAgent.call_args_list[1].kwargs["model"], "batch-model"
+            )
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_batch_per_task_model_overrides_top_level(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 45}
+        mock_creds.return_value = {
+            "model": "parent-model",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._run_single_child"
+        ) as mock_run:
+            MockAgent.return_value = MagicMock()
+            mock_run.side_effect = [
+                {
+                    "task_index": 0,
+                    "status": "completed",
+                    "summary": "A",
+                    "api_calls": 2,
+                    "duration_seconds": 1.0,
+                    "_child_role": "leaf",
+                    "_child_cost_usd": 0.15,
+                },
+                {
+                    "task_index": 1,
+                    "status": "completed",
+                    "summary": "B",
+                    "api_calls": 2,
+                    "duration_seconds": 1.0,
+                    "_child_role": "leaf",
+                    "_child_cost_usd": 0.27,
+                },
+            ]
+
+            delegate_task(
+                tasks=[
+                    {"goal": "Investigate module A", "model": "task-a"},
+                    {"goal": "Investigate module B"},
+                ],
+                model="batch-model",
+                parent_agent=parent,
+            )
+
+            # Per-task model beats top-level; the other task falls back to it.
+            self.assertEqual(MockAgent.call_args_list[0].kwargs["model"], "task-a")
+            self.assertEqual(
+                MockAgent.call_args_list[1].kwargs["model"], "batch-model"
+            )
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_per_call_provider_resolves_and_reaches_child(
+        self, mock_resolve, mock_creds, mock_cfg
+    ):
+        mock_cfg.return_value = {"max_iterations": 45}
+        mock_creds.return_value = {
+            "model": "parent-model",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        mock_resolve.return_value = {
+            "provider": "minimax",
+            "base_url": "https://api.minimax.io",
+            "api_key": "sk-minimax",
+            "api_mode": "anthropic_messages",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="x",
+                provider="minimax-cn",
+                model="minimax/MiniMax-M2",
+                parent_agent=parent,
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["provider"], "minimax")
+            self.assertEqual(kwargs["base_url"], "https://api.minimax.io")
+            self.assertEqual(kwargs["api_key"], "sk-minimax")
+            self.assertEqual(kwargs["api_mode"], "anthropic_messages")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_per_call_provider_without_api_key_returns_json_error(
+        self, mock_resolve, mock_creds, mock_cfg
+    ):
+        mock_cfg.return_value = {"max_iterations": 45}
+        mock_creds.return_value = {
+            "model": "parent-model",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        mock_resolve.return_value = {"api_key": ""}
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            result = json.loads(
+                delegate_task(goal="x", provider="bad", parent_agent=parent)
+            )
+
+        self.assertIn("error", result)
+        self.assertIn("no API key", result["error"])
+        # Credential failure must fail fast before any child is constructed.
+        MockAgent.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Schema exposure
+    # ------------------------------------------------------------------
+
+    def test_schema_exposes_model_and_provider(self):
+        from tools.registry import registry
+
+        with (
+            patch("tools.delegate_tool._get_max_concurrent_children", return_value=7),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=4),
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+        ):
+            definition = registry.get_definitions({"delegate_task"})[0]["function"]
+
+        top_props = definition["parameters"]["properties"]
+        self.assertIn("model", top_props)
+        self.assertIn("provider", top_props)
+        self.assertEqual(top_props["model"]["type"], "string")
+        self.assertEqual(top_props["provider"]["type"], "string")
+
+        task_props = top_props["tasks"]["items"]["properties"]
+        self.assertIn("model", task_props)
+        self.assertIn("provider", task_props)
+        self.assertEqual(task_props["model"]["type"], "string")
+        self.assertEqual(task_props["provider"]["type"], "string")
+
 
 class TestChildCredentialPoolResolution(unittest.TestCase):
     def test_same_provider_shares_parent_pool(self):
