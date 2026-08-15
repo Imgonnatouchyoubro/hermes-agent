@@ -3625,10 +3625,9 @@ def delegate_task(
         try:
             task_creds.append(
                 _apply_per_call_overrides(
-                    cfg,
                     creds,
-                    model=task.get("model"),
-                    provider=task.get("provider"),
+                    model=task.get("model") or top_model,
+                    provider=task.get("provider") or top_provider,
                 )
             )
         except ValueError as exc:
@@ -4393,7 +4392,6 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
 
 def _apply_per_call_overrides(
-    cfg: dict,
     base_creds: dict,
     model: Optional[str] = None,
     provider: Optional[str] = None,
@@ -4686,7 +4684,8 @@ DELEGATE_TASK_SCHEMA = {
                     "provider and any delegation.provider. A NAMED provider only (e.g. "
                     "openrouter, anthropic, nous) resolved through the existing provider "
                     "config — arbitrary endpoints/URLs are NOT accepted. Combine with "
-                    "'model'. In batch mode, tasks[].provider beats this top-level value."
+                    "'model' (without 'model', the child uses that provider's default "
+                    "model). In batch mode, tasks[].provider beats this top-level value."
                 ),
             },
             "tasks": {
